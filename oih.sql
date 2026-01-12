@@ -1,8 +1,7 @@
-
 /****************************************************
                      OIH report 
 ****************************************************/
--- weekly on sats
+-- report on the last available Sat as of query run date 
 DROP TABLE IF EXISTS oih_report_calcs;
 CREATE TEMP TABLE oih_report_calcs AS (
     with cte1 as (
@@ -17,7 +16,8 @@ CREATE TEMP TABLE oih_report_calcs AS (
         where region_id=1
             and realm='CAAmazon'
             and gl in ( 199, 75, 194, 325, 121, 510, 364 ) -- Consumables
-            and rundate::date = '2025-11-22'::date         -- test
+            and rundate::date = NEXT_DAY(CURRENT_DATE - INTERVAL '7 days', 'Saturday')  -- automated date filter
+            -- and rundate::date = '2026-01-03'::date                                   -- manual date filter
         group by
             rundate::date,
             gl, vendor, asin, title,
@@ -31,27 +31,46 @@ CREATE TEMP TABLE oih_report_calcs AS (
     where total_oih_quantity > 0 
 );
 
+DROP TABLE IF EXISTS oih_report_calcs_comp;
+CREATE TEMP TABLE oih_report_calcs_comp AS (
+
+    select 
+        oih.rundate,
+        oih.gl, vcc.company_code,
+        oih.asin, oih.title,
+        oih.exclusion_reason_code,
+        oih.buyer_exclusion_reason,
+        sum(oih.total_oih_quantity) as total_oih_quantity,
+        sum(oih.vendor_cost_on_receipt) as vendor_cost_on_receipt,
+        sum(oih.total_oih_cost) as total_oih_cost
+    from oih_report_calcs oih
+        left join andes.roi_ml_ddl.vendor_company_codes vcc
+        on oih.vendor = vcc.vendor_code
+);
+
+
+
 DROP TABLE IF EXISTS auto_noofer;
 CREATE TEMP TABLE auto_noofer AS (
     select *
-    from oih_report_calcs
+    from oih_report_calcs_comp
     where upper(exclusion_reason_code) = 'AUTO_NOOFFER'
 );
 
 DROP TABLE IF EXISTS other_types_excl;
 CREATE TEMP TABLE other_types_excl AS (
     select *
-    from oih_report_calcs
+    from oih_report_calcs_comp
     where upper(exclusion_reason_code) != 'AUTO_NOOFFER'
 );
 
 
--- first table in Juan's report
-DROP TABLE IF EXISTS oih_focus;
-CREATE TEMP TABLE oih_focus AS (
+-- "Top 10 Overall OIH ASINs"
+DROP TABLE IF EXISTS oih_overall;
+CREATE TEMP TABLE oih_overall AS (
     with cte as (
         select * from auto_noofer
-        union ALL
+        UNION ALL
         select * from other_types_excl
     ),
     rk as (
@@ -59,34 +78,57 @@ CREATE TEMP TABLE oih_focus AS (
         from cte
     )
     select 
-        rk.rundate, rk.gl, c.company_code, rk.vendor, rk.asin, rk.title,
+        rk.rundate, rk.gl, rk.company_code, rk.asin, rk.title,
         rk.exclusion_reason_code,
-        rk.total_oih_quantity, rk.total_oih_cost
+        rk.total_oih_quantity, rk.total_oih_cost,
+        'oih_overall' as table_name
     from rk 
-        left join andes.roi_ml_ddl.vendor_company_codes c
-        on rk.vendor = c.vendor_code
     where rk <= 10  
 );
  
+-- "Top 10 No offer OIH ASINs"
+DROP TABLE IF EXISTS oih_no_offer;
+CREATE TEMP TABLE oih_overall AS (
+    with cte as (
+        select *, dense_rank() over(order by total_oih_cost desc) as rk
+        from auto_noofer
+    )       
+    select 
+        rk.rundate, rk.gl, rk.company_code, rk.asin, rk.title,
+        rk.exclusion_reason_code,
+        rk.total_oih_quantity, rk.total_oih_cost,
+        'oih_no_offer' as table_name
+    from rk 
+    where rk <= 10          
+);
+
+-- putting OIH reports together
+DROP TABLE IF EXISTS oih_report;
+CREATE TEMP TABLE oih_report AS (
+    SELECT * FROM oih_overall
+    UNION ALL
+    SELECT * FROM oih_no_offer
+);
+
 
 /****************************************************
                  mapping owner
 ****************************************************/
--- polo contacts
 -- https://datacentral.a2z.com/hoot/providers/af356408-2477-4af4-8c63-f8fd32216c5f/tables/pma_contacts/versions/9?tab=schema
 DROP TABLE IF EXISTS oih_vm;
 CREATE TEMP TABLE oih_vm AS (
     SELECT
         oih.*,
         pma.user_id as vm_alias
-    FROM oih_focus oih
+    FROM oih_report oih
         LEFT JOIN andes.polo.pma_contacts pma
             ON pma.company_code = oih.company_code
             AND oih.gl = pma.gl
     WHERE pma.role = 'VendorManager'
-            AND pma.region = 'NA'
-            AND pma.marketscope = 'CA'
-            and pma.deleted=0
+        AND pma.region = 'NA'
+        AND pma.marketscope = 'CA'
+        AND pma.deleted=0
+        AND pma.invalid=1
 );
 
 
@@ -117,9 +159,9 @@ CREATE TEMPORARY TABLE forecast AS (
             , COALESCE(forecast_quantity_week_4, 0) as forecast_quantity_week_4
         FROM ANDES.GIP_FCST_DDL.O_ASIN_WEEKLY_FORECASTS_V2 f
             INNER JOIN forecast_date fd
-            ON f.forecast_creation_day = fd.forecast_creation_day
-            INNER JOIN other_types_excl o
-            on f.asin = o.asin
+                ON f.forecast_creation_day = fd.forecast_creation_day
+            INNER JOIN oih_report o
+                ON f.asin = o.asin
         where f.region_id=1
             and f.marketplace_id=7
             and f.FORECAST_TYPE_CODE = 'P70'
@@ -144,17 +186,20 @@ CREATE TEMPORARY TABLE woc_buyable AS (
 );
 
 
+SELECT * FROM woc_buyable;
+
 /****************************************************
         asin buyability (Selection Central)
 ****************************************************/
-DROP TABLE IF EXISTS buyability;
-CREATE TEMP TABLE buyability AS (
-    select * 
-    from "andes_ext"."scp-cia"."catalog_contribution_issue_events" 
-    where marketplace_id=7
-        and sku='B0BGT84G2R'
+-- https://datacentral.a2z.com/cradle#/CAISM_Hubble_Admin/profiles/506da073-b39c-4d10-89ef-1aad711ceb97
+-- DROP TABLE IF EXISTS buyability;
+-- CREATE TEMP TABLE buyability AS (
+--     select * 
+--     from "andes_ext"."scp-cia"."catalog_contribution_issue_events" 
+--     where marketplace_id=7
+--         and sku='B0BGT84G2R'
         
-);
+-- );
 
  
 
