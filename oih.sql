@@ -1,26 +1,51 @@
+/*
+/*+ETLM {
+    depend:{
+        replace:[
+            {name:"andes.oih_ddl.OIH_RECOMMEND_DETAIL"}, partition: {type: "Marketplaces", values: [7]}
+            {name:"andes.roi_ml_ddl.vendor_company_codes"},partition: {type: "Marketplaces", values: [7]}
+            {name:"andes.polo.pma_contacts"},partition: {type: "Marketplaces", values: [7]}
+            {name:"andes.gip_fcst_ddl.O_ASIN_WEEKLY_FORECASTS_V2"},partition: {type: "Marketplaces", values: [7]}
+        ]
+    }
+}*/
+*/
+
+/****************************************************
+            get latest available date
+****************************************************/
+DROP TABLE IF EXISTS latest_date;
+CREATE TEMP TABLE latest_date AS (
+    select max(rundate::date) as rundate
+    from andes.oih_ddl.OIH_RECOMMEND_DETAIL  
+    where region_id=1
+        and realm='CAAmazon'
+        and gl in ( 199, 75, 194, 325, 121, 510, 364 )  
+);
+
 /****************************************************
                      OIH report 
 ****************************************************/
 -- report on the last available Sat as of query run date 
 DROP TABLE IF EXISTS oih_report_calcs;
 CREATE TEMP TABLE oih_report_calcs AS (
+    
     with cte1 as (
         select 
-            rundate::date as rundate,
+            d.rundate::date as rundate,
             gl, vendor, asin, title,
             exclusion_reason_code,
             buyer_exclusion_reason,
             sum(oih_action_quantity) as total_oih_quantity, 
             max(vendor_cost_on_receipt) as vendor_cost_on_receipt
-        from andes.oih_ddl.OIH_RECOMMEND_DETAIL  
+        from andes.oih_ddl.OIH_RECOMMEND_DETAIL d
         where region_id=1
             and realm='CAAmazon'
-            and gl in ( 199, 75, 194, 325, 121, 510, 364 ) -- Consumables
-            and rundate::date = NEXT_DAY(CURRENT_DATE - INTERVAL '7 days', 'Saturday')  -- automated date filter
+            and gl in ( 199, 75, 194, 325, 121, 510, 364)                               -- Consumables
+            and d.rundate::date = (select rundate from latest_date)                     -- latest available date filter    
             -- and rundate::date = '2026-01-03'::date                                   -- manual date filter
         group by
-            rundate::date,
-            gl, vendor, asin, title,
+            d.rundate::date, gl, vendor, asin, title,
             exclusion_reason_code, buyer_exclusion_reason
     )
 
@@ -31,9 +56,9 @@ CREATE TEMP TABLE oih_report_calcs AS (
     where total_oih_quantity > 0 
 );
 
+
 DROP TABLE IF EXISTS oih_report_calcs_comp;
 CREATE TEMP TABLE oih_report_calcs_comp AS (
-
     select 
         oih.rundate,
         oih.gl, vcc.company_code,
@@ -46,6 +71,12 @@ CREATE TEMP TABLE oih_report_calcs_comp AS (
     from oih_report_calcs oih
         left join andes.roi_ml_ddl.vendor_company_codes vcc
         on oih.vendor = vcc.vendor_code
+    group by
+        oih.rundate,
+        oih.gl, vcc.company_code,
+        oih.asin, oih.title,
+        oih.exclusion_reason_code,
+        oih.buyer_exclusion_reason
 );
 
 
@@ -88,8 +119,8 @@ CREATE TEMP TABLE oih_overall AS (
  
 -- "Top 10 No offer OIH ASINs"
 DROP TABLE IF EXISTS oih_no_offer;
-CREATE TEMP TABLE oih_overall AS (
-    with cte as (
+CREATE TEMP TABLE oih_no_offer AS (
+    with rk as (
         select *, dense_rank() over(order by total_oih_cost desc) as rk
         from auto_noofer
     )       
@@ -117,23 +148,27 @@ CREATE TEMP TABLE oih_report AS (
 -- https://datacentral.a2z.com/hoot/providers/af356408-2477-4af4-8c63-f8fd32216c5f/tables/pma_contacts/versions/9?tab=schema
 DROP TABLE IF EXISTS oih_vm;
 CREATE TEMP TABLE oih_vm AS (
+    WITH pma_vm AS (
+        SELECT company_code, gl, user_id
+        FROM andes.polo.pma_contacts
+        WHERE role = 'VendorManager'
+          AND region = 'NA'
+          AND marketscope = 'CA'
+          AND deleted = 0
+          AND invalid = 0
+    )
     SELECT
         oih.*,
-        pma.user_id as vm_alias
+        pma_vm.user_id AS vm_alias
     FROM oih_report oih
-        LEFT JOIN andes.polo.pma_contacts pma
-            ON pma.company_code = oih.company_code
-            AND oih.gl = pma.gl
-    WHERE pma.role = 'VendorManager'
-        AND pma.region = 'NA'
-        AND pma.marketscope = 'CA'
-        AND pma.deleted=0
-        AND pma.invalid=1
+    LEFT JOIN pma_vm
+      ON pma_vm.company_code = oih.company_code
+     AND pma_vm.gl = oih.gl
 );
 
 
 /****************************************************
-        forecast (buyable asins only?)
+        forecast (buyable asins only)
 ****************************************************/
 --https://datacentral.a2z.com/providers/gip-fcst/tables/O_ASIN_WEEKLY_FORECASTS_V2/versions/5?tab=schema
 DROP TABLE IF EXISTS forecast;
@@ -179,10 +214,15 @@ CREATE TEMPORARY TABLE forecast AS (
 ****************************************************/
 DROP TABLE IF EXISTS woc_buyable;
 CREATE TEMPORARY TABLE woc_buyable AS (
-    SELECT o.*, f.p70_weekly_avg, COALESCE(o.total_oih_quantity/f.p70_weekly_avg, 0) as oih_woc 
+    SELECT o.*,
+           f.p70_weekly_avg,
+           CASE
+               WHEN f.p70_weekly_avg IS NULL OR f.p70_weekly_avg = 0 THEN 0
+               ELSE o.total_oih_quantity / f.p70_weekly_avg
+           END as oih_woc
     FROM oih_vm o
         LEFT JOIN forecast f
-        ON o.asin = f.asin 
+        ON o.asin = f.asin
 );
 
 
